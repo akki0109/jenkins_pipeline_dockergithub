@@ -1,0 +1,97 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        IMAGE_NAME = "netflix:${BUILD_NUMBER}"
+        CONTAINER_NAME = "netflix-container-${BUILD_NUMBER}"
+        PORT = sh(script: 'shuf -i 8000-9000 -n 1', returnStdout: true).trim()
+        PREV_BUILD_NUMBER = "${BUILD_NUMBER.toInteger() - 1}"
+        PREV_CONTAINER_NAME = "netflix-container-${PREV_BUILD_NUMBER}"
+    }
+    stages {
+        stage('clean workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'GIT_TOKEN', variable: 'GIT_TOKEN')]) {
+                        def gitUrl = "https://akki0109:${GIT_TOKEN}@github.com/akki0109/DevSecOps-Project-kube.git"
+                        git branch: 'main', url: gitUrl
+                    }
+                }
+            }
+        }
+        stage("Sonarqube Analysis ") {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Netflix \
+                    -Dsonar.projectKey=Netflix '''
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"
+            }
+        }
+        stage('OWASP FS SCAN') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+        stage('TRIVY FS SCAN') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+        stage("Docker Build & Push") {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker build --build-arg TMDB_V3_API_KEY=22626e11f69b607cb6687d3516a5c406 -t ${IMAGE_NAME} ."
+                        sh "docker tag ${IMAGE_NAME} djtechengineer/netflix:${BUILD_NUMBER}"
+                        sh "docker push djtechengineer/netflix:${BUILD_NUMBER}"
+                    }
+                }
+            }
+        }
+        stage("TRIVY") {
+            steps {
+                sh "trivy image djtechengineer/netflix:${BUILD_NUMBER} > trivyimage.txt"
+            }
+        }
+        stage('Deploy to container') {
+            steps {
+                sh "docker run -d --name ${CONTAINER_NAME} -p ${PORT}:80 djtechengineer/netflix:${BUILD_NUMBER}"
+            }
+        }
+        stage('Remove old container') {
+            steps {
+                script {
+                    sh "docker rm -f ${PREV_CONTAINER_NAME}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            emailext attachLog: true,
+                subject: "'${currentBuild.result}'",
+                body: "Project: ${env.JOB_NAME}<br/>" +
+                    "Build Number: ${env.BUILD_NUMBER}<br/>" +
+                    "URL: ${env.BUILD_URL}<br/>",
+                to: 'sharma.0109akash@gmail.com',               
+                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+        }
+    }
+}
+
